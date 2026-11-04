@@ -1,0 +1,94 @@
+# Ultralytics YOLOMM - Residual Fusion with MCFGatedFusion222
+# Base: yolo11n-mm-residual-mcfgatedfusion.yaml
+#
+# Main idea:
+# - Preserve the multilevel residual fusion topology.
+# - Replace direct RGB/X Concat at P2-P5 with MCFGatedFusion222.
+# - Add light zero-initialized 1x1 refinements and channel recalibration.
+# - Keep the starting behavior close to the original gated residual path.
+
+nc: 80
+scales:
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  # ========== RGB branch ==========
+  - [-1, 1, Conv, [64, 3, 2], 'RGB']      # 0-P1/2 RGB
+  - [-1, 1, Conv, [128, 3, 2]]            # 1-P2/4 RGB
+  - [-1, 2, C3k2, [256, False, 0.25]]     # 2 RGB P2
+  - [-1, 1, Conv, [256, 3, 2]]            # 3-P3/8 RGB
+  - [-1, 2, C3k2, [512, False, 0.25]]     # 4 RGB P3
+  - [-1, 1, Conv, [512, 3, 2]]            # 5-P4/16 RGB
+  - [-1, 2, C3k2_MLCA, [512, True]]            # 6 RGB P4
+  - [-1, 1, Conv, [1024, 3, 2]]           # 7-P5/32 RGB
+  - [-1, 2, C3k2_MLCA, [1024, True]]           # 8 RGB P5
+  - [-1, 1, SPPF, [1024, 5]]              # 9 RGB final
+
+  # ========== X branch ==========
+  - [-1, 1, Conv, [64, 3, 2], 'X']        # 10-P1/2 X
+  - [-1, 1, Conv, [128, 3, 2]]            # 11-P2/4 X
+  - [-1, 2, C3k2, [256, False, 0.25]]     # 12 X P2
+  - [-1, 1, Conv, [256, 3, 2]]            # 13-P3/8 X
+  - [-1, 2, C3k2, [512, False, 0.25]]     # 14 X P3
+  - [-1, 1, Conv, [512, 3, 2]]            # 15-P4/16 X
+  - [-1, 2, C3k2_MLCA, [512, True]]            # 16 X P4
+  - [-1, 1, Conv, [1024, 3, 2]]           # 17-P5/32 X
+  - [-1, 2, C3k2_MLCA, [1024, True]]           # 18 X P5
+  - [-1, 1, SPPF, [1024, 5]]              # 19 X final
+
+  # ========== Multilevel residual fusion with gated auxiliary depth ==========
+  - [[1, 11], 1, MCFGatedFusion222, ['add', 3]]   # 20 P2 RGB + gated X + refine + recal
+  - [-1, 1, Conv, [256, 1, 1]]                 # 21 P2 residual adjust
+  - [-1, 1, C3k2, [256, False, 0.25]]          # 22 P2 residual enhance
+  - [22, 1, Conv, [256, 3, 2]]                 # 23 P2->P3 align
+
+  - [[3, 13], 1, MCFGatedFusion222, ['add', 3]]   # 24 P3 RGB + gated X + refine + recal
+  - [[24, 23], 1, Concat, [1]]                 # 25 P3 gated + P2 residual
+  - [-1, 1, Conv, [512, 1, 1]]                 # 26 P3 residual adjust
+  - [-1, 2, C3k2, [512, False, 0.25]]          # 27 P3 residual enhance
+  - [27, 1, Conv, [512, 3, 2]]                 # 28 P3->P4 align
+
+  - [[5, 15], 1, MCFGatedFusion222, ['add', 3]]   # 29 P4 RGB + gated X + refine + recal
+  - [[29, 28], 1, Concat, [1]]                 # 30 P4 gated + P3 residual
+  - [-1, 1, Conv, [1024, 1, 1]]                # 31 P4 residual adjust
+  - [-1, 2, C3k2_MLCA, [1024, True]]                # 32 P4 residual enhance
+  - [32, 1, Conv, [1024, 3, 2]]                # 33 P4->P5 align
+
+  - [[9, 19], 1, MCFGatedFusion222, ['add', 3]]   # 34 P5 RGB + gated X + refine + recal
+  - [[34, 33], 1, Concat, [1]]                 # 35 P5 gated + P4 residual
+  - [-1, 2, C3k2_MLCA, [1024, True]]                # 36 final fusion process
+  - [-1, 2, C2PSA, [1024]]                     # 37 final feature enhancement
+
+  # ========== Reverse residual enhancement for detection head ==========
+  - [[2, 22], 1, Concat, [1]]                  # 38 RGB P2 + gated residual P2
+  - [-1, 1, Conv, [256, 1, 1]]                 # 39 enhanced P2
+
+  - [[4, 27], 1, Concat, [1]]                  # 40 RGB P3 + gated residual P3
+  - [-1, 1, Conv, [512, 1, 1]]                 # 41 enhanced P3
+
+  - [[6, 32], 1, Concat, [1]]                  # 42 RGB P4 + gated residual P4
+  - [-1, 1, Conv, [512, 1, 1]]                 # 43 enhanced P4
+
+head:
+  - [37, 1, nn.Upsample, [None, 2, "nearest"]]  # 44 P5->P4
+  - [[-1, 43], 1, Concat, [1]]                  # 45 + enhanced P4
+  - [-1, 2, C3k2, [512, False]]                 # 46 P4 fusion
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 47 P4->P3
+  - [[-1, 41], 1, Concat, [1]]                  # 48 + enhanced P3
+  - [-1, 2, C3k2, [256, False]]                 # 49 P3/8-small
+
+  - [-1, 1, Conv, [256, 3, 2]]                  # 50 P3->P4
+  - [[-1, 46], 1, Concat, [1]]                  # 51 + P4 fusion
+  - [-1, 2, C3k2, [512, False]]                 # 52 P4/16-medium
+
+  - [-1, 1, Conv, [512, 3, 2]]                  # 53 P4->P5
+  - [[-1, 37], 1, Concat, [1]]                  # 54 + final P5
+  - [-1, 2, C3k2_MLCA, [1024, True]]                 # 55 P5/32-large
+
+  - [[49, 52, 55], 1, Detect, [nc]]             # 56 Detect(P3, P4, P5)
