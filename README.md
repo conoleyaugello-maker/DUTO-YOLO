@@ -1,2 +1,0 @@
-# DUTO-YOLO
-Code for DUTO-YOLO
